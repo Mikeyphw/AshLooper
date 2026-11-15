@@ -608,6 +608,29 @@ list_modules() {
     log "###############"
 }
 
+record_recovery_item() {
+    local kind="$1" item_id="$2" item_name="$3"
+    local pending="$ASHLOOPER_DIR/disabled-report.pending"
+    local tab line
+
+    [ -n "$item_id" ] || return 1
+    case "$kind" in module|script) ;; *) return 1 ;; esac
+
+    # One physical line per item; names and IDs are untrusted module metadata.
+    item_id=$(printf '%s' "$item_id" | tr '\r\n\t' '   ' | cut -c 1-160)
+    item_name=$(printf '%s' "$item_name" | tr '\r\n\t' '   ' | cut -c 1-160)
+    [ -n "$item_name" ] || item_name="$item_id"
+    mkdir -p "$ASHLOOPER_DIR" || return 1
+    tab=$(printf '\t')
+    line="${kind}${tab}${item_id}${tab}${item_name}"
+    # No duplicate report lines when protection escalates over several boots.
+    if [ -f "$pending" ] && grep -Fqx "$line" "$pending" 2>/dev/null; then
+        return 0
+    fi
+    printf '%s\n' "$line" >> "$pending" || return 1
+    chmod 600 "$pending" 2>/dev/null || :
+}
+
 disable_script() {
     id="$1"
     prefix="${id%%:*}"
@@ -711,9 +734,17 @@ lockdown() {
                 fi
             fi
 
-            touch "$module_folder/disable"
-            log "Disabled module: $id"
-            enabled_modules=$((enabled_modules + 1))
+            if [ -f "$module_folder/disable" ]; then
+                log "Module already disabled: $id (no new recovery action)"
+            elif touch "$module_folder/disable"; then
+                log "Disabled module: $id"
+                label=$(get_prop "name" "$module_folder/module.prop")
+                [ -n "$label" ] || label="$id"
+                record_recovery_item "module" "$id" "$label" || log "Warning: could not record disabled module: $id"
+                enabled_modules=$((enabled_modules + 1))
+            else
+                log "Error disabling module: $id"
+            fi
         fi
     done
 
@@ -739,8 +770,12 @@ lockdown() {
                     continue
                 fi
 
-                disable_script "$id"
-                enabled_modules=$((enabled_modules + 1))
+                if disable_script "$id" && [ -f "$f" ] && [ ! -s "$f" ] && [ ! -x "$f" ]; then
+                    record_recovery_item "script" "$id" "$fname" || log "Warning: could not record disabled script: $id"
+                    enabled_modules=$((enabled_modules + 1))
+                else
+                    log "Error disabling script: $id"
+                fi
             done
         done
     fi
@@ -918,12 +953,28 @@ disable_new_mods() {
     for id_clean in $target_ids; do
         case "$id_clean" in
             svc:*)
-                disable_script "$id_clean"
+                script_name="${id_clean#svc:}"
+                script_path="$SERVICE_D/$script_name"
+                if [ -f "$script_path" ] && { [ -x "$script_path" ] || [ -s "$script_path" ]; }; then
+                    if disable_script "$id_clean" && [ -f "$script_path" ] && [ ! -s "$script_path" ] && [ ! -x "$script_path" ]; then
+                        record_recovery_item "script" "$id_clean" "$script_name" || log "Warning: could not record disabled script: $id_clean"
+                    else
+                        log "Error disabling changed script: $id_clean"
+                    fi
+                fi
                 ;;
             *)
                 if [ -d "$mdir/$id_clean" ]; then
-                    touch "$mdir/$id_clean/disable"
-                    log "Module disabled: $mdir/$id_clean"
+                    if [ -f "$mdir/$id_clean/disable" ]; then
+                        log "Module already disabled: $id_clean"
+                    elif touch "$mdir/$id_clean/disable"; then
+                        log "Module disabled: $mdir/$id_clean"
+                        label=$(get_prop "name" "$mdir/$id_clean/module.prop")
+                        [ -n "$label" ] || label="$id_clean"
+                        record_recovery_item "module" "$id_clean" "$label" || log "Warning: could not record disabled module: $id_clean"
+                    else
+                        log "Error disabling module: $id_clean"
+                    fi
                 else
                     log "Module folder not found: $mdir/$id_clean"
                 fi

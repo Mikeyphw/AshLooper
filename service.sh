@@ -245,6 +245,16 @@ while [ "$current_time" -lt "$stability_end" ]; do
 done
 
 log "SystemUI stability checks passed. Device is stable."
+
+# Deliver only after a stable Android boot. Pending data survives reboot and
+# failed notification attempts, and is not affected by the settings reset.
+if [ -s "$ASHLOOPER_DIR/disabled-report.pending" ]; then
+    if /system/bin/sh "$MODPATH/recovery-notify.sh" send; then
+        log "Android recovery notification delivered; report archived."
+    else
+        log "Android recovery notification failed; report retained for next boot."
+    fi
+fi
 log "Current loop value: $real_loops"
 
 new_timeout=$((elapsed + 15))

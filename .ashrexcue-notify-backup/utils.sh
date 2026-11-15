@@ -1,0 +1,994 @@
+#!/system/bin/sh
+
+SETTINGS="$MODPATH/settings.prop"
+mdir="/data/adb/modules"
+LOG_DIR="/cache/looper"
+ASHLOOPER_DIR="/data/adb/ashlooper"
+TMP_FILE="$ASHLOOPER_DIR/tmp_modules.json"
+MODULE_LIST="$ASHLOOPER_DIR/module.json"
+JQ="$MODPATH/bin/jq"
+SERVICE_D="/data/adb/service.d"
+POSTMOUNT_D="/data/adb/post-mount.d"
+POSTFSDATA_D="/data/adb/post-fs-data.d"
+
+STAB_MIN=45
+STAB_MAX=90
+STAB_DEFAULT=60
+
+chooseport() {
+  # Original idea by chainfire and ianmacd @xda-developers
+  # Touch support by AshBorn (@Ripper_Hybrid)
+  local delay="${1:-10}"
+  local touch="${2:-0}"
+  local retry_count=0
+  local max_retries=2
+  local line deadline now pattern
+
+  if [ "$touch" = "1" ]; then
+    pattern="KEY_VOLUMEUP.*DOWN|KEY_VOLUMEDOWN.*DOWN|ABS_MT_TRACKING_ID"
+  else
+    pattern="KEY_VOLUMEUP.*DOWN|KEY_VOLUMEDOWN.*DOWN"
+  fi
+
+  while true; do
+    now=$(date +%s)
+    deadline=$((now + delay))
+    while [ "$now" -lt "$deadline" ]; do
+      line=$(timeout -s 2 1 /system/bin/getevent -lq 2>/dev/null | grep -m 1 -E "$pattern")
+      case "$line" in
+        *KEY_VOLUMEUP*DOWN*)
+          sleep 0.2
+          return 0
+          ;;
+        *KEY_VOLUMEDOWN*DOWN*)
+          sleep 0.2
+          return 1
+          ;;
+        *ABS_MT_TRACKING_ID*)
+          sleep 0.2
+          return 2
+          ;;
+      esac
+      now=$(date +%s)
+    done
+    retry_count=$((retry_count + 1))
+    if [ "$retry_count" -gt "$max_retries" ]; then
+      if [ "$touch" = "1" ]; then
+        echo "- Input not detected after 3 attempts. Aborting."
+        exit 1
+      fi
+      echo "  > Volume key not detected after $max_retries attempts. Auto-selecting Current Option."
+      return 0
+    fi
+    echo "  > Input not detected. Attempt $retry_count of $max_retries. Try again"
+  done
+}
+
+in_range() {
+    case "$1" in ''|*[!0-9]*) return 1 ;; esac
+    [ "$1" -ge "$2" ] && [ "$1" -le "$3" ]
+}
+
+check_bins() {
+    MISSING_BIN=""
+    FOUND_BINS=""
+    for b in "$@"; do
+        f="$MODPATH/bin/$b"
+        [ -s "$f" ] || { MISSING_BIN="$b"; return 1; }
+        [ -x "$f" ] || chmod 755 "$f" 2>/dev/null
+        "$f" </dev/null >/dev/null 2>&1
+        case $? in 126|127) MISSING_BIN="$b"; return 1 ;; esac
+        FOUND_BINS="$FOUND_BINS $b"
+    done
+    FOUND_BINS="${FOUND_BINS# }"
+    return 0
+}
+
+find_busybox() {
+    for candidate in /data/adb/ksu/bin/busybox /data/adb/magisk/busybox /data/adb/ap/bin/busybox; do
+        if [ -f "$candidate" ] && [ -x "$candidate" ]; then
+            if "$candidate" true >/dev/null 2>&1; then
+                echo "$candidate"
+                return 0
+            fi
+        fi
+    done
+    if command -v busybox >/dev/null 2>&1; then
+        sys_bb=$(command -v busybox)
+        if "$sys_bb" true >/dev/null 2>&1; then
+            echo "$sys_bb"
+            return 0
+        fi
+    fi
+    return 1
+}
+
+get_part_size() {
+  local s
+  s=$(blockdev --getsize64 "$1" 2>/dev/null)
+  case "$s" in ''|*[!0-9]*) s=$(wc -c < "$1" 2>/dev/null) ;; esac
+  case "$s" in ''|*[!0-9]*) s=0 ;; esac
+  echo "$s"
+}
+
+get_avail_kb() {
+  local a
+  a=$(df -Pk "$1" 2>/dev/null | awk 'NR==2{print $4}')
+  case "$a" in ''|*[!0-9]*) a="" ;; esac
+  echo "$a"
+}
+
+sha_run() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$@"
+  elif [ -n "$SHA_BB" ]; then
+    "$SHA_BB" sha256sum "$@"
+  else
+    return 1
+  fi
+}
+
+[ -d /data/adb/ksu ] || [ -f /data/adb/ksu/ksu ] && KSU=1
+[ -d /data/adb/magisk ] || [ -f /data/adb/magisk/magisk ] && MAGISK=1
+[ -f /data/adb/apd ] && [ -d /data/adb/ap ] && APATCH=1
+
+if [ "$KSU" ]; then
+    method="KernelSU"
+elif [ "$APATCH" ]; then
+    method="APatch"
+elif [ "$MAGISK" ]; then
+    method="Magisk"
+else
+    if [ -w "/data/adb/modules" ]; then
+        method="Unknown Root"
+    else
+        ui_print "✘ ERROR: Root solution not detected!"
+        abort
+    fi
+fi
+
+get_root_version() {
+    local version=""
+
+    if [ "$APATCH" ]; then
+        version=$(/data/adb/apd -V 2>/dev/null | head -n 1)
+    fi
+
+    if [ "$KSU" ]; then
+        local ksu_ver=$(/data/adb/ksud -V 2>/dev/null | head -n 1)
+        if [ -n "$version" ]; then
+            version="$version | $ksu_ver"
+        else
+            version="$ksu_ver"
+        fi
+    fi
+
+    if [ "$MAGISK" ]; then
+        local magisk_name=$(/data/adb/magisk/magisk -v 2>/dev/null | head -n 1)
+        local magisk_code=$(/data/adb/magisk/magisk -V 2>/dev/null | head -n 1)
+        local magisk_ver="${magisk_name} (${magisk_code})"
+        if [ -n "$version" ]; then
+            version="$version | $magisk_ver"
+        else
+            version="$magisk_ver"
+        fi
+    fi
+
+    echo "${version:-Unknown}"
+}
+
+get_prop() {
+    local prop="$1"
+    local target_file="${2:-$SETTINGS}"
+
+    if [ ! -f "$target_file" ]; then
+        return 1
+    fi
+
+    local value=$(grep -E "^[[:space:]]*$prop=" "$target_file" 2>/dev/null | head -n 1 | cut -d'=' -f2-)
+    value=$(printf '%s' "$value" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' -e 's/\r$//')
+    printf '%s' "$value"
+}
+
+get_boot_id() {
+    local id=""
+    if [ -r "/proc/sys/kernel/random/boot_id" ]; then
+        id=$(cat "/proc/sys/kernel/random/boot_id" 2>/dev/null | tr -d ' \t\r\n')
+    fi
+    printf '%s' "${id:-unknown}"
+}
+
+get_kernel_uptime() {
+    local up=""
+    if [ -r "/proc/uptime" ]; then
+        up=$(awk '{print int($1)}' /proc/uptime 2>/dev/null)
+    fi
+    case "$up" in
+        ''|*[!0-9]*) up="0" ;;
+    esac
+    printf '%s' "$up"
+}
+
+save_boot_marker() {
+    local bid kup
+    bid=$(get_boot_id)
+    kup=$(get_kernel_uptime)
+
+    if [ "$bid" != "unknown" ]; then
+        modify_prop -s "boot_id" "$bid"
+    fi
+    if [ "$kup" -gt 0 ]; then
+        modify_prop -s "kernel_uptime" "$kup"
+    fi
+    log "Boot marker saved: Boot ID=$bid | Kernel Uptime=${kup}s"
+}
+
+is_soft_reboot() {
+    local saved_id saved_uptime current_id current_uptime
+    saved_id=$(get_prop "boot_id")
+    saved_uptime=$(get_prop "kernel_uptime")
+    current_id=$(get_boot_id)
+    current_uptime=$(get_kernel_uptime)
+
+    if [ -n "$saved_id" ] && [ "$saved_id" != "none" ] && [ "$saved_id" != "unknown" ] &&
+       [ "$current_id" != "unknown" ] && [ "$current_id" = "$saved_id" ]; then
+        log "Soft reboot check: Boot ID matched $current_id"
+        return 0
+    fi
+
+    if [ -n "$saved_uptime" ] && [ "$saved_uptime" != "none" ] && [ "$saved_uptime" != "0" ] &&
+       [ "$saved_uptime" -le "$current_uptime" ]; then
+        log "Soft reboot check: kernel uptime carried over ($saved_uptime -> ${current_uptime}s)"
+        return 0
+    fi
+
+    log "Soft reboot check: no match, real reboot"
+    return 1
+}
+
+modify_prop() {
+    local silent=false
+    if [ "$1" = "-s" ]; then
+        silent=true
+        shift
+    fi
+    local action="$1"
+    local value="$2"
+    local target_file="${3:-$SETTINGS}"
+
+    if [ ! -f "$target_file" ]; then
+        log "Error: File $target_file not found."
+        return 1
+    fi
+
+    if [ "$action" = "+" ]; then
+        if grep -qE "^[[:space:]]*$value=" "$target_file"; then
+            current=$(grep -E "^[[:space:]]*$value=" "$target_file" | head -n 1 | cut -d'=' -f2)
+            case "$current" in
+                ''|*[!0-9]*) current=0 ;;
+            esac
+            new_value=$((current + 1))
+
+            sed -i -E "s~^[[:space:]]*$value=.*~$value=$new_value~" "$target_file" || return 1
+
+            if [ "$silent" = false ]; then
+                log "Increased $value in $(basename "$target_file"): $current → $new_value"
+            fi
+        else
+            if [ "$silent" = false ]; then
+                log "Property $value not found in $(basename "$target_file"), skipping increment"
+            fi
+        fi
+    elif [ "$action" = "sd" ]; then
+        if grep -qE "^[[:space:]]*orig_description=" "$target_file" 2>/dev/null; then
+            [ "$silent" = false ] && log "orig_description already saved in $(basename "$target_file"), skipping"
+        else
+            cur=$(get_prop "description" "$target_file")
+            if [ -n "$cur" ]; then
+                [ -n "$(tail -c1 "$target_file")" ] && printf '\n' >> "$target_file"
+                printf 'orig_description=%s\n' "$cur" >> "$target_file"
+                if [ "$silent" = false ]; then
+                    log "Saved original description in $(basename "$target_file")"
+                fi
+            fi
+        fi
+    elif [ "$action" = "rs" ]; then
+        saved=$(get_prop "orig_description" "$target_file")
+        if [ -n "$saved" ]; then
+            local safe_value=$(echo "$saved" | sed 's/[&~]/\\&/g')
+            sed -i -E "s~^[[:space:]]*description=.*~description=$safe_value~" "$target_file" || return 1
+            sed -i '/^orig_description=/d' "$target_file"
+            if [ "$silent" = false ]; then
+                log "Restored original description in $(basename "$target_file")"
+            fi
+        fi
+    else
+        if grep -qE "^[[:space:]]*$action=" "$target_file"; then
+            local safe_value=$(echo "$value" | sed 's/[&~]/\\&/g')
+            sed -i -E "s~^[[:space:]]*$action=.*~$action=$safe_value~" "$target_file" || return 1
+
+            if [ "$silent" = false ]; then
+                log "Set $action to $value in $(basename "$target_file")"
+            fi
+        else
+            if [ "$silent" = false ]; then
+                log "Property $action not found in $(basename "$target_file"), skipping set"
+            fi
+        fi
+    fi
+}
+
+fix_prop() {
+    if grep -qE "^[[:space:]]*$1=" "$SETTINGS"; then
+        modify_prop -s "$1" "$2"
+    else
+        [ -n "$(tail -c1 "$SETTINGS")" ] && printf '\n' >> "$SETTINGS"
+        printf '%s=%s\n' "$1" "$2" >> "$SETTINGS"
+    fi
+}
+
+sanitize_settings() {
+    mkdir -p "$LOG_DIR"
+    s_changed=0
+
+    s_mode=$(get_prop "mode")
+    case "$s_mode" in
+        1|2) ;;
+        *) fix_prop "mode" "1"; log "Warning sanitized mode to 1 (was: $s_mode)"; s_changed=1 ;;
+    esac
+
+    s_thresh=$(get_prop "threshold")
+    case "$s_thresh" in
+        1|2|3|4) ;;
+        *) fix_prop "threshold" "2"; log "Warning sanitized threshold to 2 (was: $s_thresh)"; s_changed=1 ;;
+    esac
+
+    s_to=$(get_prop "timeout")
+    if ! in_range "$s_to" 1 100; then
+        fix_prop "timeout" "60"; log "Warning sanitized timeout to 60 (was: $s_to)"; s_changed=1
+    fi
+
+    s_stab=$(get_prop "stability_time")
+    if ! in_range "$s_stab" "$STAB_MIN" "$STAB_MAX"; then
+        fix_prop "stability_time" "$STAB_DEFAULT"; log "Warning sanitized stability_time to $STAB_DEFAULT (was: $s_stab)"; s_changed=1
+    fi
+
+    s_es=$(get_prop "extra_stability")
+    case "$s_es" in
+        On|Off) ;;
+        *) fix_prop "extra_stability" "Off"; log "Warning sanitized extra_stability to Off (was: $s_es)"; s_changed=1 ;;
+    esac
+
+    s_ms=$(get_prop "monitor_scripts")
+    case "$s_ms" in
+        On|Off) ;;
+        *) fix_prop "monitor_scripts" "Off"; log "Warning sanitized monitor_scripts to Off (was: $s_ms)"; s_changed=1 ;;
+    esac
+
+    s_loops=$(get_prop "loops")
+    case "$s_loops" in
+        ''|*[!0-9]*) fix_prop "loops" "0"; log "Warning sanitized loops to 0 (was: $s_loops)"; s_changed=1 ;;
+        *)
+            if [ "$s_loops" -gt 10 ]; then
+                fix_prop "loops" "0"; log "Warning sanitized loops to 0 (was: $s_loops)"; s_changed=1
+            fi
+            ;;
+    esac
+
+    s_disable=$(get_prop "disable")
+    case "$s_disable" in
+        none|partial|full) ;;
+        *) fix_prop "disable" "none"; log "Warning sanitized disable to none (was: $s_disable)"; s_changed=1 ;;
+    esac
+
+    s_log=$(get_prop "log")
+    case "$s_log" in
+        *-*) ;;
+        *) fix_prop "log" "1-0"; log "Warning sanitized log to 1-0 (was: $s_log)"; s_changed=1 ;;
+    esac
+
+    if [ "$s_changed" -eq 1 ]; then
+        write_description
+        log "Settings sanitized. Turns out reading the comments is free. Try it next time."
+    fi
+}
+
+write_description() {
+    d_mode=$(get_prop "mode")
+    case "$d_mode" in
+        2) d_mode="DMR" ;;
+        *) d_mode="DM" ;;
+    esac
+    d_thresh=$(get_prop "threshold")
+    case "$d_thresh" in ''|*[!0-9]*) d_thresh=1 ;; esac
+    if [ "$d_thresh" = "1" ]; then
+        d_boot_word="boot"
+    else
+        d_boot_word="boots"
+    fi
+    d_timeout=$(get_prop "timeout")
+    case "$d_timeout" in ''|*[!0-9]*) d_timeout=60 ;; esac
+    d_scripts=$(get_prop "monitor_scripts")
+    case "$d_scripts" in ''|none) d_scripts="Off" ;; esac
+    d_stab_time=$(get_prop "stability_time")
+    if ! in_range "$d_stab_time" "$STAB_MIN" "$STAB_MAX"; then
+        d_stab="Stability: Off"
+    else
+        d_stab="Stability: On (${d_stab_time}s)"
+    fi
+    d_wl=$(get_prop "whitelist" | tr -d " '\"\r\n")
+    d_wl_mod=0
+    d_wl_scr=0
+    for d_wl_item in $(printf '%s' "$d_wl" | tr ',' ' '); do
+        if [ -n "$d_wl_item" ] && [ "$d_wl_item" != "AshLooper" ]; then
+            case "$d_wl_item" in
+                svc:*) d_wl_scr=$((d_wl_scr + 1)) ;;
+                *) d_wl_mod=$((d_wl_mod + 1)) ;;
+            esac
+        fi
+    done
+    if [ "$d_wl_mod" -gt 0 ] && [ "$d_wl_scr" -gt 0 ]; then
+        d_wl_text="${d_wl_mod} Module / ${d_wl_scr} Script"
+    elif [ "$d_wl_mod" -gt 0 ]; then
+        d_wl_text="${d_wl_mod} Module"
+    elif [ "$d_wl_scr" -gt 0 ]; then
+        d_wl_text="${d_wl_scr} Script"
+    else
+        d_wl_text="None"
+    fi
+    modify_prop -s "description" "🔰 Status: Mode $d_mode | Threshold: ${d_thresh} ${d_boot_word} | Timeout: ${d_timeout}s | Scripts (.d): $d_scripts | ${d_stab} | Whitelist: ${d_wl_text}." "$MODPATH/module.prop"
+}
+
+set_log_file() {
+    val=$(get_prop log)
+    if [ -z "$val" ]; then val="1-0"; fi
+    f=$(echo "$val" | cut -d'-' -f1)
+    LOG_FILE="$LOG_DIR/AshReXcueSession-$f.log"
+}
+
+rotate_logs() {
+    mkdir -p "$LOG_DIR"
+
+    val=$(get_prop log)
+    if [ -z "$val" ]; then val="1-0"; fi
+
+    f=$(echo "$val" | cut -d'-' -f1)
+    b=$(echo "$val" | cut -d'-' -f2)
+
+    b=$((b + 1))
+
+    if [ "$b" -gt 10 ]; then
+        b=1
+        f=$((f + 1))
+
+        if [ "$f" -gt 10 ]; then
+            f=1
+        fi
+    fi
+
+    LOG_FILE="$LOG_DIR/AshReXcueSession-$f.log"
+
+    if [ "$b" -eq 1 ]; then
+        rm -f "$LOG_FILE"
+        touch "$LOG_FILE"
+    fi
+
+    CURRENT_BOOT="$b"
+    modify_prop -s "log" "$f-$b"
+}
+
+start_run() {
+    mkdir -p "$ASHLOOPER_DIR"
+    rotate_logs
+
+    local current_date=$(date '+%Y-%m-%d' 2>/dev/null || echo "1970-01-01")
+    local current_full=$(date '+%d.%m.%y %T')
+    local install_date=$(get_prop install_date)
+    local rtc_status="CORRECT"
+    local mode=$(get_prop mode)
+    local disable=$(get_prop disable)
+    local extra_stability=$(get_prop extra_stability)
+    local monitor_scripts=$(get_prop monitor_scripts)
+
+    if [ "$install_date" != "none" ] && [ "$install_date" != "unknown" ] && \
+       [ "$current_date" \< "$install_date" ]; then
+        rtc_status="BACKWARD ($current_date < $install_date)"
+    fi
+
+    log "◆◆◆◆◆◆◆ NEW BOOT $CURRENT_BOOT ◆◆◆◆◆◆◆◆"
+    log "AshReXcue Process Started"
+    log "Date: $current_full | RTC Status: $rtc_status"
+    log "Executing post-fs-data.sh"
+    log "Running on $ROOT_TYPE"
+    ROOT_VERSION=$(get_root_version)
+    log "Root Version: $ROOT_VERSION"
+    local boot_reason
+    boot_reason=$(getprop sys.boot.reason 2>/dev/null)
+    log "Boot reason: ${boot_reason:-Unknown}"
+    log "Boot ID: $(get_boot_id)"
+    log "Kernel Uptime: $(get_kernel_uptime)s"
+    log "Device: $(getprop ro.product.model 2>/dev/null || echo Unknown)"
+    log "Android: $(getprop ro.build.version.release 2>/dev/null || echo Unknown)"
+    log "Module Version: $(get_prop version "$MODPATH/module.prop" 2>/dev/null || echo Unknown)"
+    log "Module Version Code: $(get_prop versionCode "$MODPATH/module.prop" 2>/dev/null || echo Unknown)"
+    log "Mode: $mode | Disable: $disable"
+    log "Extra Stability: $extra_stability | Monitor Scripts: $monitor_scripts"
+}
+
+log() {
+    if [ -z "$LOG_FILE" ]; then set_log_file; fi
+    local timestamp=$(date '+%T')
+    echo "[$timestamp] >[$1]<" >> "$LOG_FILE"
+    echo "" >> "$LOG_FILE"
+}
+
+list_modules() {
+    log "###############"
+    log "Available modules: "
+    count=0
+    whitelist=$(get_prop "whitelist" | sed 's/"//g' | sed "s/'//g" | sed 's/ //g')
+    for module_folder in "$mdir"/*; do
+        if [ -d "$module_folder" ]; then
+            folder_name=$(basename "$module_folder")
+            id=$(printf '%s' "$folder_name" | sed 's/"//g' | sed "s/'//g" | sed 's/ //g')
+            if [ -f "$module_folder/module.prop" ]; then
+                prop_id=$(get_prop "id" "$module_folder/module.prop")
+                if [ -n "$prop_id" ]; then
+                    id=$(printf '%s' "$prop_id" | sed 's/"//g' | sed "s/'//g" | sed 's/ //g')
+                fi
+            fi
+            is_whitelisted=0
+            case ",$whitelist," in
+                *",${id},"* | *",${folder_name},"* ) is_whitelisted=1 ;;
+            esac
+            if [ -f "$module_folder/disable" ]; then
+                status="- Disabled"
+            else
+                status="- Active"
+            fi
+            if [ "$is_whitelisted" -eq 1 ]; then
+                status="$status - Whitelist"
+            fi
+
+            count=$((count + 1))
+            log "$count. $folder_name $status"
+        fi
+    done
+
+    if [ "$(get_prop "monitor_scripts")" != "Off" ]; then
+        for scandir in "$SERVICE_D:svc"; do
+            dpath="${scandir%%:*}"
+            prefix="${scandir##*:}"
+            [ -d "$dpath" ] || continue
+
+            for f in "$dpath"/*.sh "$dpath"/.*.sh; do
+                [ -f "$f" ] || continue
+                [ ! -x "$f" ] && [ ! -s "$f" ] && continue
+                fname=$(basename "$f")
+                id="${prefix}:${fname}"
+
+                is_whitelisted=0
+                case ",$whitelist," in
+                    *",${id},"* ) is_whitelisted=1 ;;
+                esac
+
+                status="- Active"
+                if [ "$is_whitelisted" -eq 1 ]; then
+                    status="$status - Whitelist"
+                fi
+
+                count=$((count + 1))
+                log "$count. $id $status"
+            done
+        done
+
+        for f in "$ASHLOOPER_DIR"/*.svc.*; do
+            [ -f "$f" ] || continue
+            base=$(basename "$f")
+            fname_ext="${base%.*}"
+            prefix="${fname_ext##*.}"
+            fname="${fname_ext%.*}"
+            id="${prefix}:${fname}"
+
+            is_whitelisted=0
+            case ",$whitelist," in
+                *",${id},"* ) is_whitelisted=1 ;;
+            esac
+
+            status="- Disabled"
+            if [ "$is_whitelisted" -eq 1 ]; then
+                status="$status - Whitelist"
+            fi
+
+            count=$((count + 1))
+            log "$count. $id $status"
+        done
+    fi
+
+    log "###############"
+}
+
+disable_script() {
+    id="$1"
+    prefix="${id%%:*}"
+    fname="${id#*:}"
+
+    case "$prefix" in
+        svc) dpath="$SERVICE_D" ;;
+        pmd) dpath="$POSTMOUNT_D" ;;
+        pfd) dpath="$POSTFSDATA_D" ;;
+        *) return 1 ;;
+    esac
+
+    src="$dpath/$fname"
+    [ -f "$src" ] || return 1
+
+    [ ! -x "$src" ] && [ ! -s "$src" ] && return 0
+
+    perm=$(stat -c %a "$src" 2>/dev/null || echo "755")
+    dest="$ASHLOOPER_DIR/${fname}.${prefix}.${perm}"
+
+    mkdir -p "$ASHLOOPER_DIR"
+    mv -f "$src" "$dest"
+
+    touch "$src"
+    chmod 000 "$src"
+
+    log "Disabled script: $src -> $dest (Dummy created)"
+}
+
+restore_script() {
+    id="$1"
+    prefix="${id%%:*}"
+    fname="${id#*:}"
+
+    case "$prefix" in
+        svc) dpath="$SERVICE_D" ;;
+        pmd) dpath="$POSTMOUNT_D" ;;
+        pfd) dpath="$POSTFSDATA_D" ;;
+        *) return 1 ;;
+    esac
+
+    src=$(ls "$ASHLOOPER_DIR/${fname}.${prefix}".* 2>/dev/null | head -n1)
+    [ -z "$src" ] || [ ! -f "$src" ] && return 1
+
+    perm="${src##*.}"
+    dest="$dpath/$fname"
+
+    rm -f "$dest"
+
+    mv -f "$src" "$dest"
+    chmod "$perm" "$dest"
+    log "Restored script: $src -> $dest (perm: $perm)"
+}
+
+lockdown() {
+    case "$(get_prop "disable")" in
+        none|partial|full) ;;
+        *)
+            log "Error: unexpected disable value '$(get_prop "disable")' in lockdown — aborting without action."
+            return 1
+            ;;
+    esac
+
+    local MODE=$(get_prop "mode")
+    local LOCKDOWN_TYPE="${1:-normal}"
+    threshold=$(get_prop "threshold")
+    whitelist=$(get_prop "whitelist" | sed 's/"//g' | sed "s/'//g" | sed 's/ //g')
+
+    if [ "$LOCKDOWN_TYPE" = "nuke" ]; then
+        log "EXTREME MEASURE: Disabling all non-whitelisted scripts to guarantee boot."
+    elif [ "$LOCKDOWN_TYPE" = "full" ]; then
+        log "Full Lockdown: Threshold ($threshold) reached. Disabling ALL modules including AshLooper..."
+    else
+        log "Threshold ($threshold) reached. Disabling non-whitelisted modules..."
+    fi
+
+    log "###########################"
+    log "Lockdown Mode Activated"
+    enabled_modules=0
+
+    for module_folder in "$mdir"/*; do
+        if [ -d "$module_folder" ]; then
+            folder_name=$(basename "$module_folder")
+            folder_name=$(printf '%s' "$folder_name" | sed 's/"//g' | sed "s/'//g" | sed 's/ //g')
+            id="$folder_name"
+
+            if [ -f "$module_folder/module.prop" ]; then
+                prop_id=$(get_prop "id" "$module_folder/module.prop")
+                [ -n "$prop_id" ] && id=$(printf '%s' "$prop_id" | sed 's/"//g' | sed "s/'//g" | sed 's/ //g')
+            fi
+
+            if [ "$LOCKDOWN_TYPE" != "full" ] && [ "$LOCKDOWN_TYPE" != "nuke" ]; then
+                is_whitelisted=0
+                case ",$whitelist," in
+                    *",${id},"* | *",${folder_name},"* ) is_whitelisted=1 ;;
+                esac
+
+                if [ "$is_whitelisted" -eq 1 ]; then
+                    log "Skipping whitelisted module: $id"
+                    continue
+                fi
+            fi
+
+            touch "$module_folder/disable"
+            log "Disabled module: $id"
+            enabled_modules=$((enabled_modules + 1))
+        fi
+    done
+
+    if [ "$(get_prop "monitor_scripts")" != "Off" ]; then
+        for scandir in "$SERVICE_D:svc"; do
+            dpath="${scandir%%:*}"
+            prefix="${scandir##*:}"
+            [ -d "$dpath" ] || continue
+
+            for f in "$dpath"/*.sh "$dpath"/.*.sh; do
+                [ -f "$f" ] || continue
+                [ ! -x "$f" ] && [ ! -s "$f" ] && continue
+                fname=$(basename "$f")
+                id="${prefix}:${fname}"
+
+                is_whitelisted=0
+                case ",$whitelist," in
+                    *",${id},"* ) is_whitelisted=1 ;;
+                esac
+
+                if [ "$is_whitelisted" -eq 1 ]; then
+                    log "Skipping whitelisted script: $id"
+                    continue
+                fi
+
+                disable_script "$id"
+                enabled_modules=$((enabled_modules + 1))
+            done
+        done
+    fi
+
+    log "Total Affected: $enabled_modules"
+    log "###########################"
+    modify_prop "loops" "0"
+    modify_prop "disable" "full"
+
+    if [ "$MODE" = "2" ]; then
+        log "Lockdown complete. Rebooting to recovery."
+        reboot recovery
+    else
+        log "Lockdown complete. Rebooting normally."
+        reboot
+    fi
+}
+
+create_mod_list() {
+    rm -f "$TMP_FILE"
+    printf '[' > "$TMP_FILE"
+    local first=1
+    BB=$(find_busybox)
+
+    for module_folder in "$mdir"/*; do
+        if [ -d "$module_folder" ]; then
+            size=$(du -s "$module_folder" 2>/dev/null | cut -f1)
+
+            if [ -f "$module_folder/disable" ]; then
+                status="disabled"
+            else
+                status="enabled"
+            fi
+
+            folder_name=$(basename "$module_folder")
+
+            id="$folder_name"
+            name="$folder_name"
+            version="unknown"
+            versionCode="0"
+
+            if [ -f "$module_folder/module.prop" ]; then
+                prop_id=$(get_prop "id" "$module_folder/module.prop")
+                prop_name=$(get_prop "name" "$module_folder/module.prop")
+                prop_version=$(get_prop "version" "$module_folder/module.prop")
+                prop_versionCode=$(get_prop "versionCode" "$module_folder/module.prop")
+
+                [ -n "$prop_id" ] && id="$prop_id"
+                [ -n "$prop_name" ] && name="$prop_name"
+                [ -n "$prop_version" ] && version="$prop_version"
+                [ -n "$prop_versionCode" ] && versionCode="$prop_versionCode"
+            fi
+
+            name=$(printf '%s' "$name" | sed 's/"/\\"/g')
+            version=$(printf '%s' "$version" | sed 's/"/\\"/g')
+
+            [ "$first" -eq 0 ] && printf ',' >> "$TMP_FILE"
+            printf '\n  {"id": "%s", "name": "%s", "version": "%s", "versionCode": "%s", "status": "%s", "size": "%s"}' "$id" "$name" "$version" "$versionCode" "$status" "$size" >> "$TMP_FILE"
+            first=0
+        fi
+    done
+
+    if [ "$(get_prop "monitor_scripts")" != "Off" ]; then
+        for scandir in "$SERVICE_D:svc"; do
+            dpath="${scandir%%:*}"
+            prefix="${scandir##*:}"
+            [ -d "$dpath" ] || continue
+
+            for f in "$dpath"/*.sh "$dpath"/.*.sh; do
+                [ -f "$f" ] || continue
+                [ ! -x "$f" ] && [ ! -s "$f" ] && continue
+
+                fname=$(basename "$f")
+                id="${prefix}:${fname}"
+                size=$(du -s "$f" 2>/dev/null | cut -f1)
+                perm=$(stat -c %a "$f" 2>/dev/null || echo "755")
+                hash=$([ -n "$BB" ] && "$BB" sha256sum "$f" 2>/dev/null | cut -d' ' -f1)
+                versionCode="${prefix};${hash:-nohash}"
+                status="enabled"
+
+                [ "$first" -eq 0 ] && printf ',' >> "$TMP_FILE"
+                printf '\n  {"id": "%s", "name": "%s", "version": "%s", "versionCode": "%s", "status": "%s", "size": "%s"}' "$id" "$fname" "$perm" "$versionCode" "$status" "$size" >> "$TMP_FILE"
+                first=0
+            done
+        done
+
+        for f in "$ASHLOOPER_DIR"/*.svc.*; do
+            [ -f "$f" ] || continue
+            base=$(basename "$f")
+            perm="${base##*.}"
+            fname_ext="${base%.*}"
+            prefix="${fname_ext##*.}"
+            fname="${fname_ext%.*}"
+
+            id="${prefix}:${fname}"
+            size=$(du -s "$f" 2>/dev/null | cut -f1)
+            hash=$([ -n "$BB" ] && "$BB" sha256sum "$f" 2>/dev/null | cut -d' ' -f1)
+            versionCode="${prefix};${hash:-nohash}"
+            status="disabled"
+
+            [ "$first" -eq 0 ] && printf ',' >> "$TMP_FILE"
+            printf '\n  {"id": "%s", "name": "%s", "version": "%s", "versionCode": "%s", "status": "%s", "size": "%s"}' "$id" "$fname" "$perm" "$versionCode" "$status" "$size" >> "$TMP_FILE"
+            first=0
+        done
+    fi
+
+    printf '\n]\n' >> "$TMP_FILE"
+}
+
+disable_new_mods() {
+    case "$(get_prop "disable")" in
+        none|partial|full) ;;
+        *)
+            log "Error: unexpected disable value '$(get_prop "disable")' in disable_new_mods — aborting without action."
+            return 1
+            ;;
+    esac
+
+    local MODE=$(get_prop "mode")
+    whitelist=$(get_prop "whitelist" | sed 's/"//g' | sed "s/'//g" | sed 's/ //g')
+
+    if [ ! -f "$MODULE_LIST" ]; then
+        log "No previous module list found. Invoking lockdown."
+        lockdown
+        return
+    fi
+
+    check_bins jq || { log "Error missing binary: $MISSING_BIN. Invoking lockdown."; lockdown; return; }
+    log "Binary OK: $FOUND_BINS"
+
+    changed_ids=$(
+        "$JQ" -n --slurpfile new "$TMP_FILE" --slurpfile old "$MODULE_LIST" '
+          ($old[0] | map({key: .id, value: .}) | from_entries) as $oldmap |
+          $new[0][] as $n |
+          ($oldmap[$n.id] // null) as $o |
+          if $o == null or ($n.name != $o.name or $n.version != $o.version or $n.versionCode != $o.versionCode or $n.status != $o.status or $n.size != $o.size) then
+            $n.id
+          else
+            empty
+          end
+        ' 2>/dev/null || echo ""
+    )
+
+    local target_ids=""
+    if [ -n "$changed_ids" ]; then
+        for id in $changed_ids; do
+            id_clean=$(printf '%s' "$id" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' -e 's/^"\(.*\)"$/\1/')
+            [ -z "$id_clean" ] && continue
+
+            is_whitelisted=0
+            case ",$whitelist," in
+                *",${id_clean},"* ) is_whitelisted=1 ;;
+            esac
+
+            if [ "$is_whitelisted" -eq 1 ]; then
+                log "Skipping changed whitelisted module: $id_clean"
+            else
+                target_ids="$target_ids $id_clean"
+            fi
+        done
+    fi
+
+    target_ids=$(echo "$target_ids" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+
+    if [ -z "$target_ids" ]; then
+        log "No non-whitelisted new/changed modules detected. Falling back to lockdown."
+        lockdown
+        return
+    fi
+
+    formatted_log=$(printf '%s' "$target_ids" | tr ' ' ',')
+    log "Targeting non-whitelisted modules: $formatted_log"
+    log "Starting disable process..."
+
+    for id_clean in $target_ids; do
+        case "$id_clean" in
+            svc:*)
+                disable_script "$id_clean"
+                ;;
+            *)
+                if [ -d "$mdir/$id_clean" ]; then
+                    touch "$mdir/$id_clean/disable"
+                    log "Module disabled: $mdir/$id_clean"
+                else
+                    log "Module folder not found: $mdir/$id_clean"
+                fi
+                ;;
+        esac
+    done
+
+    modify_prop "loops" "0"
+    modify_prop "disable" "partial"
+    if [ "$MODE" = "2" ]; then
+        log "Partial disable complete. Rebooting to recovery."
+        reboot recovery
+    else
+        log "Partial disable complete. Rebooting normally."
+        reboot
+    fi
+}
+
+handle_boot_loop() {
+    local MODE=$(get_prop "mode")
+    loops=$(get_prop "loops")
+    disable_mode=$(get_prop "disable")
+    threshold=$(get_prop "threshold")
+    log "Boot loops: $loops/$threshold | Protection: $disable_mode"
+
+    if [ "$loops" -ge "$threshold" ]; then
+        case "$disable_mode" in
+            "none")
+                log "Threshold reached - disabling new modules"
+                disable_new_mods
+                ;;
+            "partial")
+                log "Threshold reached - activating lockdown"
+                lockdown
+                ;;
+            "full")
+                log "Well, you're fu*ked ¯\_(ツ)_/¯"
+                log "Full protection enabled but bootloop still occurred"
+                log "NUKING all scripts and disabling all modules including AshLooper."
+                lockdown "nuke"
+                ;;
+            *)
+                log "Invalid protection mode - taking no action"
+                ;;
+        esac
+
+        list_modules
+    else
+        list_modules
+    fi
+}
+
+trigger_crash_reboot() {
+    case "$(get_prop "disable")" in
+        none|partial|full) ;;
+        *)
+            log "Error: unexpected disable value '$(get_prop "disable")' in trigger_crash_reboot — aborting without reboot."
+            return 1
+            ;;
+    esac
+
+    log "Crash detected. Restoring true loop count $real_loops and disable mode $real_disable."
+    modify_prop "loops" "$real_loops"
+    modify_prop "disable" "$real_disable"
+    handle_boot_loop
+    log "Rebooting device to cycle bootloop protection..."
+    reboot
+}
