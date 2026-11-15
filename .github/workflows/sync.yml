@@ -3,6 +3,8 @@ name: AshReXcue Fork / Manual Candidate Build
 # SAFETY: Replaces inherited workflow that force-pushed to RipperHybrid GitLab.
 # This workflow never pushes, publishes a release, or sends files to third parties.
 on:
+  pull_request:
+    branches: [Master]
   workflow_dispatch:
 permissions:
   contents: read
