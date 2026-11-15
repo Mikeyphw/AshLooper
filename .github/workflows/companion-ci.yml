@@ -1,42 +1,31 @@
-name: AshReXcue Companion / Offline CI
+name: AshReXcue Companion RF03 / Offline Qualification
 on:
   push:
-    paths:
-      - 'companion/**'
-      - 'tests/test_companion_rf02.py'
-      - '.github/workflows/companion-ci.yml'
-      - 'scripts/apply_refurbish.py'
-      - 'service.sh'
+    paths: ['companion/**', '.github/workflows/companion-ci.yml']
   pull_request:
-    paths:
-      - 'companion/**'
-      - 'tests/test_companion_rf02.py'
-      - '.github/workflows/companion-ci.yml'
-      - 'scripts/apply_refurbish.py'
-      - 'service.sh'
+    paths: ['companion/**', '.github/workflows/companion-ci.yml']
   workflow_dispatch:
 permissions:
   contents: read
 jobs:
-  offline-checks:
+  offline:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-      - name: Shell syntax (no Android SDK or device writes)
-        run: sh -n companion/*.sh companion/bin/*.sh service.sh
-      - name: Offline regression tests
-        run: python3 -m unittest discover -s tests -p 'test_companion_rf02.py' -v
-      - name: Build candidate module
-        run: python3 companion/tools/build_zip.py --out dist/AshReXcue-Companion-v0.2.0.zip
-      - name: Reproducibility
+      - name: Shell syntax
+        run: sh -n companion/service.sh companion/action.sh companion/customize.sh companion/uninstall.sh companion/bin/companion.sh
+      - name: Offline tests
+        run: python3 -m unittest discover -s companion/tests -v
+      - name: Candidate ZIP and reproducibility
         run: |
-          python3 companion/tools/build_zip.py --out dist/rebuilt.zip
-          cmp dist/AshReXcue-Companion-v0.2.0.zip dist/rebuilt.zip
-          sha256sum dist/AshReXcue-Companion-v0.2.0.zip
+          python3 companion/tools/build_zip.py --out dist/Companion-RF03.zip
+          python3 companion/tools/build_zip.py --out dist/Companion-RF03-again.zip
+          cmp dist/Companion-RF03.zip dist/Companion-RF03-again.zip
+          unzip -t dist/Companion-RF03.zip
       - uses: actions/upload-artifact@v4
         with:
-          name: ashrexcue-companion-rf02-candidate
-          path: dist/AshReXcue-Companion-v0.2.0.zip
+          name: ashrexcue-companion-rf03-candidate
+          path: dist/Companion-RF03.zip

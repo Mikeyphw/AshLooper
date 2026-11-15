@@ -1,3 +1,4 @@
 #!/system/bin/sh
-# Preserve incident history on uninstall for explicit user inspection/removal.
+# Preserve recovery history in /data/adb/ashrexcue-companion for manual review.
+# Never touch /data/adb/modules/AshLooper or its settings.
 exit 0

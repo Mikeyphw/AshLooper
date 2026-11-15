@@ -246,14 +246,10 @@ done
 
 log "SystemUI stability checks passed. Device is stable."
 
-# Deliver only after stable boot. If the independent companion is enabled,
-# hand over notification ownership without changing boot recovery behavior.
-# ARC_COMPANION_RF02_HANDOFF
+# Deliver only after a stable Android boot. Pending data survives reboot and
+# failed notification attempts, and is not affected by the settings reset.
 if [ -s "$ASHLOOPER_DIR/disabled-report.pending" ]; then
-    arc_companion="/data/adb/modules/ashrexcue_companion"
-    if [ -d "$arc_companion" ] && [ ! -f "$arc_companion/disable" ] && [ -f "$arc_companion/service.sh" ]; then
-        log "AshReXcue Companion enabled; retaining pending report for companion delivery."
-    elif /system/bin/sh "$MODPATH/recovery-notify.sh" send; then
+    if /system/bin/sh "$MODPATH/recovery-notify.sh" send; then
         log "Android recovery notification delivered; report archived."
     else
         log "Android recovery notification failed; report retained for next boot."

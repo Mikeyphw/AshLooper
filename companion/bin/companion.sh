@@ -1,28 +1,32 @@
 #!/system/bin/sh
-# AshReXcue Companion RF02 -- consumes the source-pinned AshLooper recovery journal.
-# No module state writes. No reboot. No recovery-engine changes at runtime.
+# AshReXcue Companion RF03 — read-only integration with ORIGINAL AshReXcue.
+# NEVER writes to the original module, scripts, system module states or logs.
 umask 077
 
 STATE="${ARC_STATE:-/data/adb/ashrexcue-companion}"
-SOURCE="${ARC_SOURCE:-/data/adb/ashlooper}"
+LOGS="${ARC_LOGS:-/cache/looper}"
 MODULES="${ARC_MODULES:-/data/adb/modules}"
-ASH_SETTINGS="${ARC_SETTINGS:-/data/adb/modules/AshLooper/settings.prop}"
-PENDING="$SOURCE/disabled-report.pending"
-LAST="$SOURCE/disabled-report.last"
+VAULT="${ARC_VAULT:-/data/adb/ashlooper}"
+SETTINGS="${ARC_SETTINGS:-/data/adb/modules/AshLooper/settings.prop}"
+SCRIPTS="${ARC_SCRIPTS:-/data/adb/service.d}"
+PARSER="${ARC_PARSER:-${0%/*}/parse-recovery.awk}"
+CURSORS="$STATE/cursors"
+QUEUE="$STATE/pending.tsv"
 HISTORY="$STATE/history"
-SVC_VAULT="$SOURCE"
-LOCK="$STATE/.notify-lock"
+LOCK="$STATE/.monitor-lock"
 WORK=""
+LOCKED=0
 
 say() { printf '%s\n' "AshReXcue Companion: $*"; }
 cleanup() {
     [ -z "$WORK" ] || rm -rf "$WORK"
-    if [ -f "$LOCK/pid" ] && [ "$(cat "$LOCK/pid" 2>/dev/null)" = "$$" ]; then
+    if [ "$LOCKED" = 1 ]; then
         rm -f "$LOCK/pid"
         rmdir "$LOCK" 2>/dev/null || :
     fi
 }
-trap cleanup EXIT HUP INT TERM
+trap cleanup EXIT
+trap 'exit 130' INT TERM HUP
 
 boot_id() {
     if [ -n "${ARC_TEST_BOOT_ID:-}" ]; then
@@ -32,35 +36,151 @@ boot_id() {
     fi
 }
 
-initialize() {
-    mkdir -p "$HISTORY" "$STATE/delivered" || return 1
-    chmod 700 "$STATE" "$HISTORY" "$STATE/delivered" 2>/dev/null || return 1
+stable_boot() {
+    [ "${ARC_TEST_STABLE:-}" = yes ] && return 0
+    [ "$(getprop sys.boot_completed 2>/dev/null)" = 1 ] || return 1
+    [ ! -f "$MODULES/AshLooper/disable" ] || return 1
+    [ "$(sed -n '/^boot=/{s/^boot=//;p;q;}' "$SETTINGS" 2>/dev/null)" = booted ] || return 1
+    bid=$(boot_id)
+    [ -n "$bid" ] || return 1
+    [ "$(sed -n '/^boot_id=/{s/^boot_id=//;p;q;}' "$SETTINGS" 2>/dev/null)" = "$bid" ]
 }
 
-lock_notification() {
+initialize() {
+    mkdir -p "$CURSORS" "$HISTORY" "$STATE/delivered" || return 1
+    chmod 700 "$STATE" "$CURSORS" "$HISTORY" "$STATE/delivered" 2>/dev/null || return 1
+}
+
+lock_monitor() {
     if mkdir "$LOCK" 2>/dev/null; then
-        printf '%s\n' "$$" > "$LOCK/pid"
+        printf '%s\n' "$$" > "$LOCK/pid" || return 1
+        LOCKED=1
         return 0
     fi
-    oldpid=$(cat "$LOCK/pid" 2>/dev/null || :)
-    case "$oldpid" in ''|*[!0-9]*) oldpid=0 ;; esac
-    if [ "$oldpid" -gt 0 ] && kill -0 "$oldpid" 2>/dev/null; then
-        say 'Another notification worker is active.'
+    old=$(cat "$LOCK/pid" 2>/dev/null || :)
+    case "$old" in ''|*[!0-9]*) old=0 ;; esac
+    if [ "$old" -gt 0 ] && kill -0 "$old" 2>/dev/null; then
+        say 'Another companion worker is already active.'
         return 1
     fi
+    # Only attempt stale-lock recovery; never remove a live lock.
     rm -f "$LOCK/pid" 2>/dev/null || :
     rmdir "$LOCK" 2>/dev/null || return 1
     mkdir "$LOCK" 2>/dev/null || return 1
-    printf '%s\n' "$$" > "$LOCK/pid"
+    printf '%s\n' "$$" > "$LOCK/pid" || return 1
+    LOCKED=1
 }
 
-stable_boot() {
-    [ "${ARC_TEST_STABLE:-}" = "yes" ] && return 0
-    [ "$(getprop sys.boot_completed 2>/dev/null)" = "1" ] || return 1
-    current=$(boot_id)
-    [ -n "$current" ] || return 1
-    [ "$(sed -n '/^boot=/{s/^boot=//;p;q;}' "$ASH_SETTINGS" 2>/dev/null)" = 'booted' ] || return 1
-    [ "$(sed -n '/^boot_id=/{s/^boot_id=//;p;q;}' "$ASH_SETTINGS" 2>/dev/null)" = "$current" ]
+# A stable first-line signature detects log truncation/rotation despite reuse
+# of the same filename. The size offset avoids reporting historical events.
+log_signature() {
+    head -n 1 "$1" 2>/dev/null | sha256sum | cut -d ' ' -f 1
+}
+log_size() {
+    wc -c < "$1" 2>/dev/null | tr -d ' '
+}
+valid_size() {
+    case "$1" in ''|*[!0-9]*) return 1 ;; esac
+}
+
+baseline() {
+    initialize || return 1
+    [ -f "$STATE/.seeded" ] && { say 'Log baseline already exists; unchanged.'; return 0; }
+    for f in "$LOGS"/AshReXcueSession-*.log; do
+        [ -f "$f" ] || continue
+        base=${f##*/}
+        sig=$(log_signature "$f")
+        size=$(log_size "$f")
+        valid_size "$size" || return 1
+        printf '%s %s\n' "$sig" "$size" > "$CURSORS/$base" || return 1
+    done
+    # Never emit a historical recovery notification on initial installation.
+    : > "$STATE/.seeded" || return 1
+    say 'Initial log baseline created (previous incidents ignored).'
+}
+
+# Read only NEW log bytes. Commit queued events before cursor updates so
+# interruption cannot silently discard an incident. A duplicate scan is safe.
+scan_logs() {
+    [ -f "$STATE/.seeded" ] || { baseline; return $?; }
+    WORK="$STATE/.work.$$"
+    mkdir -m 700 "$WORK" "$WORK/cursors" || return 1
+    if [ -f "$QUEUE" ]; then
+        cp "$QUEUE" "$WORK/queue.tsv" || return 1
+    else
+        : > "$WORK/queue.tsv" || return 1
+    fi
+    for f in "$LOGS"/AshReXcueSession-*.log; do
+        [ -f "$f" ] || continue
+        base=${f##*/}
+        sig=$(log_signature "$f")
+        size=$(log_size "$f")
+        valid_size "$size" || return 1
+        prev_sig=''; prev_size=0
+        if [ -f "$CURSORS/$base" ]; then
+            read -r prev_sig prev_size < "$CURSORS/$base"
+            valid_size "$prev_size" || prev_size=0
+        fi
+        if [ "$sig" != "$prev_sig" ] || [ "$size" -lt "$prev_size" ]; then
+            prev_size=0
+        fi
+        if [ "$size" -gt "$prev_size" ]; then
+            tail -c "+$((prev_size + 1))" "$f" | awk -f "$PARSER" >> "$WORK/queue.tsv" || return 1
+        fi
+        printf '%s %s\n' "$sig" "$size" > "$WORK/cursors/$base" || return 1
+    done
+    # Deduplicate by type+ID within one pending incident.
+    awk -F '\t' 'NF >= 3 && !seen[$1 SUBSEP $2]++ {print}' "$WORK/queue.tsv" > "$WORK/unique.tsv" || return 1
+    mv -f "$WORK/unique.tsv" "$QUEUE" || return 1
+    for f in "$WORK/cursors"/*; do
+        [ -f "$f" ] || continue
+        mv -f "$f" "$CURSORS/${f##*/}" || return 1
+    done
+    rm -rf "$WORK"
+    WORK=''
+}
+
+# Return a friendly label only when an ORIGINAL module is currently disabled.
+# Reject duplicate IDs, traversal, malformed identifiers and unrelated modules.
+verify_item() {
+    kind=$1
+    identifier=$2
+    case "$identifier" in ''|.|..|*/*|*[!a-zA-Z0-9_.@+:-]*) return 1 ;; esac
+    if [ "$kind" = module ]; then
+        found=0
+        disabled=0
+        label=$identifier
+        for mod in "$MODULES"/*; do
+            [ -d "$mod" ] || continue
+            folder=${mod##*/}
+            declared_id=$(sed -n '/^id=/{s/^id=//;p;q;}' "$mod/module.prop" 2>/dev/null | tr -d '\r')
+            if [ "$identifier" = "$folder" ] || [ "$identifier" = "$declared_id" ]; then
+                found=$((found + 1))
+                if [ -f "$mod/disable" ]; then
+                    disabled=$((disabled + 1))
+                    label=$(sed -n '/^name=/{s/^name=//;p;q;}' "$mod/module.prop" 2>/dev/null)
+                    [ -n "$label" ] || label=$identifier
+                fi
+            fi
+        done
+        [ "$found" -eq 1 ] && [ "$disabled" -eq 1 ] || return 1
+    elif [ "$kind" = script ]; then
+        case "$identifier" in svc:*.sh) ;; *) return 1 ;; esac
+        fname=${identifier#svc:}
+        [ -f "$SCRIPTS/$fname" ] && [ ! -s "$SCRIPTS/$fname" ] && [ ! -x "$SCRIPTS/$fname" ] || return 1
+        vault_found=0
+        for bak in "$VAULT/$fname.svc."*; do
+            [ -f "$bak" ] && vault_found=1
+        done
+        [ "$vault_found" -eq 1 ] || return 1
+        label=$fname
+    else
+        return 1
+    fi
+    # Drop control characters and cap the system notification label.
+    label=$(printf '%s' "$label" | tr '\t\r\n' '   ' | cut -c 1-90)
+    [ -n "$label" ] || label=$identifier
+    return 0
 }
 
 shell_quote() {
@@ -81,165 +201,125 @@ post_notification() {
     su 2000 -c "$command" >/dev/null 2>&1
 }
 
-# True only when the recorded action is still reflected in the root module state.
-# Module IDs are matched to either folder names or module.prop IDs, never paths.
-verify_disabled() {
-    kind=$1
-    identifier=$2
-    case "$identifier" in ''|.|..|*/*|*[!a-zA-Z0-9_.@+:-]*) return 1 ;; esac
-    case "$kind" in
-        module)
-            # Duplicate IDs are ambiguous and cannot be attributed safely.
-            matches=0
-            enabled_markers=0
-            for mod in "$MODULES"/*; do
-                [ -d "$mod" ] || continue
-                folder=${mod##*/}
-                prop_id=$(sed -n '/^id=/{s/^id=//;p;q;}' "$mod/module.prop" 2>/dev/null | tr -d '\r')
-                if [ "$identifier" = "$folder" ] || [ "$identifier" = "$prop_id" ]; then
-                    matches=$((matches + 1))
-                    [ -f "$mod/disable" ] && enabled_markers=$((enabled_markers + 1))
-                fi
-            done
-            [ "$matches" -eq 1 ] && [ "$enabled_markers" -eq 1 ] && return 0
-            ;;
-        script)
-            case "$identifier" in svc:*.sh) ;; *) return 1 ;; esac
-            fname=${identifier#svc:}
-            for backup in "$SVC_VAULT/$fname".svc.*; do
-                [ -f "$backup" ] && return 0
-            done
-            ;;
-    esac
-    return 1
-}
-
 make_report() {
-    # Consume only complete journal lines and verify present state.
-    # Ignore malformed or untrusted entries rather than guessing attribution.
-    : > "$WORK/verified.tsv"
-    : > "$WORK/events.tsv"
+    : > "$WORK/report.tsv" || return 1
+    : > "$WORK/verified.tsv" || return 1
     tab=$(printf '\t')
-    while IFS="$tab" read -r kind identifier name; do
+    while IFS="$tab" read -r kind identifier stage; do
         case "$kind" in module|script) ;; *) continue ;; esac
-        [ -n "$identifier" ] || continue
-        [ -n "$name" ] || name=$identifier
-        name=$(printf '%s' "$name" | tr '\t\r\n' '   ' | cut -c 1-90)
-        if verify_disabled "$kind" "$identifier"; then
-            printf '%s\t%s\t%s\tconfirmed\n' "$kind" "$identifier" "$name" >> "$WORK/events.tsv"
-            printf '%s\t%s\t%s\n' "$kind" "$identifier" "$name" >> "$WORK/verified.tsv"
+        if verify_item "$kind" "$identifier"; then
+            printf '%s\t%s\t%s\t%s\tconfirmed\n' "$kind" "$identifier" "$label" "$stage" >> "$WORK/report.tsv"
+            printf '%s\t%s\t%s\t%s\n' "$kind" "$identifier" "$label" "$stage" >> "$WORK/verified.tsv"
         else
-            printf '%s\t%s\t%s\tunverified-or-restored\n' "$kind" "$identifier" "$name" >> "$WORK/events.tsv"
+            printf '%s\t%s\t%s\t%s\tunverified-or-restored\n' "$kind" "$identifier" "$identifier" "$stage" >> "$WORK/report.tsv"
         fi
-    done < "$PENDING"
-    # Deduplicate based on kind and ID, retaining first verified name.
-    awk -F '\t' '!seen[$1 SUBSEP $2]++' "$WORK/verified.tsv" > "$WORK/unique.tsv" || return 1
-    count=$(wc -l < "$WORK/unique.tsv" | tr -d ' ')
+    done < "$QUEUE"
+    count=$(wc -l < "$WORK/verified.tsv" | tr -d ' ')
+    valid_size "$count" || return 1
     title="AshReXcue: $count item(s) disabled"
     body='Bootloop recovery completed. Still disabled:'
     shown=0
-    while IFS="$tab" read -r kind identifier name; do
+    while IFS="$tab" read -r kind identifier name stage; do
         [ "$shown" -lt 12 ] || break
-        if [ "$kind" = 'script' ]; then label="Script: $name"; else label=$name; fi
+        if [ "$kind" = script ]; then label="Script: $name"; else label=$name; fi
         body="$body
 • $label ($identifier)"
         shown=$((shown + 1))
-    done < "$WORK/unique.tsv"
+    done < "$WORK/verified.tsv"
     if [ "$count" -gt "$shown" ]; then
         body="$body
-...and $((count - shown)) more. Review companion history."
+...and $((count - shown)) more; see companion history."
     fi
     body="$body
 Review/restore manually in your root manager."
 }
 
-archive_report() {
-    # We only move the report once notification delivery is accepted (or there
-    # are no confirmed disabled modules). Never discard a failed delivery.
-    mv -f "$PENDING" "$LAST"
-}
-
-send_pending() {
-    stable_boot || { say 'Not a verified stable boot; leaving journal unchanged.'; return 2; }
-    [ -s "$PENDING" ] || { say 'No pending recovery report.'; return 0; }
-    initialize || return 1
-    lock_notification || return 1
-    WORK="$STATE/.work.$$"
-    mkdir -m 700 "$WORK" || return 1
-    cp "$PENDING" "$WORK/source.tsv" || return 1
-    make_report || return 1
+save_history() {
+    checksum=$(sha256sum "$QUEUE" | cut -d ' ' -f 1)
+    case "$checksum" in ''|*[!0-9a-f]*) return 1 ;; esac
     bid=$(boot_id)
-    case "$bid" in ''|*[!a-zA-Z0-9-]*) say 'Invalid boot ID'; return 1 ;; esac
-    sum=$(sha256sum "$WORK/source.tsv" 2>/dev/null | cut -d' ' -f1)
-    case "$sum" in ''|*[!0-9a-f]*) say 'Cannot hash report'; return 1 ;; esac
-    key="$bid-$sum"
+    case "$bid" in ''|*[!a-zA-Z0-9-]*) return 1 ;; esac
+    key="$bid-$checksum"
     archive="$HISTORY/$key.tsv"
     if [ ! -f "$archive" ]; then
-        cp "$WORK/events.tsv" "$WORK/archived.tsv" || return 1
-        mv -f "$WORK/archived.tsv" "$archive" || return 1
+        cp "$WORK/report.tsv" "$WORK/history.tsv" || return 1
+        mv -f "$WORK/history.tsv" "$archive" || return 1
     fi
+}
+
+process_queue() {
+    [ -s "$QUEUE" ] || { say 'No newly attributed module disables.'; return 0; }
+    WORK="$STATE/.work.$$"
+    mkdir -m 700 "$WORK" || return 1
+    make_report || return 1
+    save_history || return 1
     if [ "$count" -eq 0 ]; then
-        say 'Recovery recorded, but no items are still disabled; not notifying.'
-        archive_report
-        return $?
+        say 'Incident recorded, but no affected items remain disabled.'
+        rm -f "$QUEUE"
+        return 0
     fi
     if [ -f "$STATE/delivered/$key" ]; then
-        say 'Delivery already acknowledged; archiving report without posting again.'
-        archive_report
-        return $?
+        say 'Previously acknowledged incident; not reposting.'
+        rm -f "$QUEUE"
+        return 0
     fi
-    attempts=1
-    while [ "$attempts" -le 4 ]; do
+    attempt=1
+    while [ "$attempt" -le 4 ]; do
         if post_notification "$title" "$body"; then
-            # Persist the ACK first so interrupted archival does not repost.
             printf '%s\n' "$key" > "$WORK/ack" || return 1
             mv -f "$WORK/ack" "$STATE/delivered/$key" || return 1
-            archive_report || return 1
-            say "Notification accepted for $count verified disabled item(s)."
+            rm -f "$QUEUE" || return 1
+            say "Notification accepted for $count confirmed disabled item(s)."
             return 0
         fi
-        say "Notification rejected ($attempts/4); journal preserved."
-        [ "$attempts" -ge 4 ] || sleep "${ARC_RETRY_SECONDS:-5}"
-        attempts=$((attempts + 1))
+        say "Notification attempt $attempt/4 rejected; incident retained."
+        [ "$attempt" -eq 4 ] || sleep "${ARC_RETRY_SECONDS:-5}"
+        attempt=$((attempt + 1))
     done
     return 1
 }
 
+notify_pending() {
+    stable_boot || { say 'AshReXcue has not confirmed a stable boot.'; return 2; }
+    initialize || return 1
+    lock_monitor || return 1
+    # Standalone integration: NEVER read or write core notification journals.
+    scan_logs || return 1
+    process_queue
+}
+
 status() {
     initialize || return 1
-    say "Source: $SOURCE"
+    say "Original AshReXcue module: $MODULES/AshLooper"
+    say "Log source: $LOGS"
     say "Current boot: $(boot_id)"
-    if stable_boot; then say 'Boot state: verified stable'; else say 'Boot state: not verified stable'; fi
-    if [ -s "$PENDING" ]; then say 'Pending source report: yes'; else say 'Pending source report: no'; fi
-    say 'Historical reports:'
-    for report in "$HISTORY"/*.tsv; do
-        [ -f "$report" ] || continue
-        printf '  %s\n' "${report##*/}"
-    done
-    if [ -f "$MODULES/ashrexcue_companion/disable" ]; then
-        say 'WARNING: Companion is disabled by root manager.'
+    if stable_boot; then say 'Boot: stable'; else say 'Boot: not yet confirmed stable'; fi
+    if [ -f "$STATE/.seeded" ]; then say 'Log baseline: initialized'; else say 'Log baseline: not initialized'; fi
+    if [ -s "$QUEUE" ]; then
+        say "Pending attributed items: $(wc -l < "$QUEUE" | tr -d ' ')"
+    else
+        say 'Pending attributed items: none'
     fi
+    say "History entries: $(find "$HISTORY" -maxdepth 1 -type f -name '*.tsv' 2>/dev/null | wc -l | tr -d ' ')"
 }
 
 case "${1:-run}" in
+    seed) baseline ;;
+    scan) stable_boot || { say 'Not stable; scan refused.'; exit 2; }; initialize && lock_monitor && scan_logs ;;
     run)
-        attempts=0
-        while [ "$attempts" -lt 180 ]; do
+        iteration=0
+        while [ "$iteration" -lt 180 ]; do
             if stable_boot; then
-                if [ -s "$PENDING" ]; then
-                    send_pending
-                    exit $?
-                fi
-                exit 0
+                notify_pending
+                exit $?
             fi
             sleep 3
-            attempts=$((attempts + 1))
+            iteration=$((iteration + 1))
         done
-        say 'Stable boot not confirmed; no notification attempted.'
-        exit 0
+        say 'No stable boot observed; no notification attempted.'
         ;;
-    notify-pending) send_pending ;;
+    notify-pending) notify_pending ;;
     test-notification) post_notification 'AshReXcue Companion test' 'Test only. No recovery state changed.' ;;
     status) status ;;
-    *) say 'Usage: companion.sh {run|status|notify-pending|test-notification}'; exit 2 ;;
+    *) say 'Usage: companion.sh {seed|scan|run|status|notify-pending|test-notification}'; exit 2 ;;
 esac

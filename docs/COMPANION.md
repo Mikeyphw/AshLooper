@@ -1,72 +1,63 @@
-# AshReXcue Companion RF02
+# AshReXcue Companion RF03 — independent original-module integration
 
-This is an **optional separately installable root module**, source-controlled in
-`companion/`. AshLooper's core module does not install the companion by default.
+**Optional standalone root module.** It is installed next to, and **does not replace**, the original [AshReXcue / AshLooper](https://github.com/RipperHybrid/AshLooper). Its module ID is `ashrexcue_companion`, not `AshLooper`.
 
-## Why a companion?
+## What it does
 
-The `Mikeyphw/AshLooper` fork already writes `disabled-report.pending` when
-it disables modules or service scripts. The companion consumes this **explicit
-journal** after AshLooper marks the current boot as stable, rechecks that
-items are actually disabled, posts one Android notification, saves an incident
-history, and archives the source journal to `disabled-report.last`.
+- Reads `/cache/looper/AshReXcueSession-*.log`, the **stock AshReXcue** recovery logs.
+- Attributes only module and `service.d` disable events within explicit recovery stages (targeted, lockdown, nuclear).
+- Verifies that disabled module markers or script backups still exist before notifying.
+- Posts a notification **after AshReXcue confirms a stable boot** using Android's shell notification service.
+- Keeps private event history and notification acknowledgements under `/data/adb/ashrexcue-companion`.
+- Ignores historical events when first installed by recording initial log offsets.
+- Never changes AshReXcue's settings, boot scripts, installed modules, disabled flags, WebUI, updater, or `/cache/looper` logs.
 
-It never enables/disables modules, restores scripts, edits protection settings,
-or reboots the device. Journal archival is the only write to AshLooper state.
+## Install on KernelSU / Magisk / APatch
 
-## Notification ownership and fallback
-
-- When the companion module `ashrexcue_companion` is installed and enabled,
-  AshLooper's `service.sh` **defers** its built-in `recovery-notify.sh` delivery.
-- When the companion is not installed, is disabled, or lacks its service script,
-  the **existing built-in notifier remains active**.
-- During nuclear/full lockdown, the companion itself may be disabled. The
-  notification cannot be guaranteed. Whitelist `ashrexcue_companion` in
-  AshLooper to protect it in ordinary lockdown; nuclear lockdown bypasses it.
-- If the companion fails to notify, it **retains the pending journal** for
-  manual retry or the next stable boot. It does not interfere with boot recovery.
-- Android may suppress notifications even when `cmd notification post` exits 0.
-  Physical Android 16 validation is still required.
-
-## Install (separately from AshLooper)
-
-After building the ZIP with `python3 companion/tools/build_zip.py --out
-AshReXcue-Companion-v0.2.0.zip`, install it in KernelSU, Magisk or APatch.
-Use the root manager's Action button or run:
+1. **Keep the original AshReXcue module installed and enabled.** Do **not** install `AshReXcue-Fork-candidate.zip`. That is a core replacement build.
+2. Back up the module and configuration before experimenting with boot protection.
+3. Install **only** `AshReXcue-Companion-v0.3.0-RF03.zip` from your root manager and reboot normally.
+4. Run the status and test notification commands:
 
 ```sh
 su -c 'sh /data/adb/modules/ashrexcue_companion/bin/companion.sh status'
 su -c 'sh /data/adb/modules/ashrexcue_companion/bin/companion.sh test-notification'
+```
+
+`test-notification` posts a test alert. It does not disable any modules, alter logs, or reboot.
+
+To manually retry an undelivered **real** recovery report after a stable boot:
+
+```sh
 su -c 'sh /data/adb/modules/ashrexcue_companion/bin/companion.sh notify-pending'
 ```
 
-`notify-pending` requires a stable completed boot. A test notification does not
-change recovery state. No service requires Python, jq or Gradle on Android.
+**Whitelist the ID `ashrexcue_companion` in AshReXcue** to reduce the chance of ordinary lockdown disabling the notifier. Nuclear lockdown overrides whitelists, so the companion cannot guarantee a notification if it is itself disabled.
 
-## Storage
+## Evidence and limitations
 
-- Input: `/data/adb/ashlooper/disabled-report.pending` (written by AshLooper)
-- Archived input: `/data/adb/ashlooper/disabled-report.last`
-- History: `/data/adb/ashrexcue-companion/history/*.tsv`
-- Idempotency ACKs: `/data/adb/ashrexcue-companion/delivered/`
+- A successful test notification proves only Android notification transport, **not real bootloop handling**.
+- The companion depends on retained readable original AshReXcue logs in `/cache/looper`. If the `/cache` partition is absent or logs are not retained, it cannot reconstruct events.
+- An event is reported only if the associated original log still exists and the module remains disabled. Restored modules and ambiguous IDs are recorded as unverified, not notified as disabled.
+- If the first boot after installation contains a recovery event but the installer could not initialize the log baseline, that event may be skipped rather than risk showing an old incident.
+- Long names are truncated to 90 characters in notifications, while logged event identifiers are preserved in history.
+- An accepted `cmd notification post` call can still be suppressed by Android's notification settings.
+- This is an **offline-tested candidate**, not physical Android 16 acceptance. Do **not** trigger a real bootloop to test it.
+- This module does **not** alter existing root-manager module enable/disable states. It only reads them.
 
-Module ID: `ashrexcue_companion`; all history/ACK directories use root-only
-permissions. Uninstall intentionally preserves history for manual inspection.
+## Source layout
 
-## Validation
+- `bin/companion.sh`: observer, state verification, notification and history
+- `bin/parse-recovery.awk`: stock AshReXcue log parser
+- `tests/test_stock_integration.py`: offline simulated root environment
+- `tools/build_zip.py`: reproducible candidate build
+- `.github/workflows/companion-ci.yml`: host-only regression and ZIP checks
+
+## Local tests
 
 ```sh
-sh -n companion/*.sh companion/bin/*.sh service.sh
-python3 -m unittest discover -s tests -p 'test_companion_rf02.py' -v
-python3 companion/tools/build_zip.py --out dist/companion.zip
+python3 -m unittest discover -s tests -v
+python3 tools/build_zip.py --out dist/AshReXcue-Companion-v0.3.0-RF03.zip
 ```
 
-Offline tests are not a substitute for hardware acceptance. Do not test a
-bootloop by deliberately bricking your daily-use phone. Check the test
-notification and read-only status first.
-
-## Provenance
-
-This independent companion functionality is an enhancement maintained in
-`Mikeyphw/AshLooper`; original AshReXcue by AshBorn / RipperHybrid.
-This source repository retains upstream attribution and license.
+Built from original AshReXcue v10.1 log conventions, with attribution to original AshBorn / RipperHybrid. The companion source is independently maintained.

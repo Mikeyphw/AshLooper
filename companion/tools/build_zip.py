@@ -1,33 +1,47 @@
 #!/usr/bin/env python3
-"""Reproducible root-module ZIP. Explicit allowlist excludes tests and repository files."""
-from argparse import ArgumentParser
+"""Deterministic standalone module candidate, never bundles AshLooper core."""
 from pathlib import Path
-from zipfile import ZipFile, ZipInfo, ZIP_DEFLATED
+import argparse
+import hashlib
+import zipfile
 
 ROOT = Path(__file__).resolve().parents[1]
-RUNTIME = (
-    'module.prop', 'service.sh', 'action.sh', 'customize.sh',
-    'uninstall.sh', 'bin/companion.sh',
+FILES = (
+    'module.prop',
+    'service.sh',
+    'action.sh',
+    'customize.sh',
+    'uninstall.sh',
+    'bin/companion.sh',
+    'bin/parse-recovery.awk',
 )
+BLOCKED = {'utils.sh', 'post-fs-data.sh', 'recovery-notify.sh', 'settings.prop'}
 
 
-def build(destination: Path):
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    with ZipFile(destination, 'w') as archive:
-        for rel in RUNTIME:
-            source = ROOT / rel
-            if not source.is_file() or source.is_symlink():
-                raise SystemExit(f'Missing or symlink module file: {rel}')
-            info = ZipInfo(rel, date_time=(2026, 1, 1, 0, 0, 0))
-            info.create_system = 3
-            info.external_attr = ((0o100755 if rel.endswith('.sh') else 0o100644) << 16)
-            info.compress_type = ZIP_DEFLATED
-            archive.writestr(info, source.read_bytes(), compress_type=ZIP_DEFLATED, compresslevel=9)
+def build(target: Path):
+    target = Path(target)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(target, 'w', compression=zipfile.ZIP_DEFLATED,
+                         compresslevel=9) as zf:
+        for file in FILES:
+            if file in BLOCKED:
+                raise ValueError('Core file included in standalone companion')
+            source = ROOT / file
+            if not source.is_file():
+                raise FileNotFoundError(source)
+            info = zipfile.ZipInfo(file, date_time=(2026, 1, 1, 0, 0, 0))
+            info.compress_type = zipfile.ZIP_DEFLATED
+            info.external_attr = ((0o100755 if file.endswith('.sh') else 0o100644) << 16)
+            zf.writestr(info, source.read_bytes(), compress_type=zipfile.ZIP_DEFLATED,
+                        compresslevel=9)
+    with zipfile.ZipFile(target) as check:
+        if set(check.namelist()) != set(FILES) or check.testzip() is not None:
+            raise ValueError('Build inventory/corruption mismatch')
+    print(f'RF03_CANDIDATE_SHA256 {hashlib.sha256(target.read_bytes()).hexdigest()}')
+    print(f'RF03_CANDIDATE_PATH {target}')
 
 
 if __name__ == '__main__':
-    parser = ArgumentParser()
+    parser = argparse.ArgumentParser()
     parser.add_argument('--out', type=Path, required=True)
-    args = parser.parse_args()
-    build(args.out)
-    print(f'Built {args.out} ({args.out.stat().st_size} bytes)')
+    build(parser.parse_args().out)
