@@ -4,5 +4,4 @@ version=10.1
 versionCode=201
 author=AshBorn (@Ripper_Hybrid)
 description=🔰 Your safety net for bad modules. Catches boot loops, disables the culprits.
-updateJson=https://ashrexcue.pages.dev/assets/update.json
 banner=https://ashrexcue.pages.dev/banner.png

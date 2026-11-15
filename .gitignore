@@ -1,0 +1,5 @@
+# Local build artifacts and temporary overlays
+dist/
+*.pyc
+__pycache__/
+.ashrexcue-notify-backup/

@@ -1,0 +1,6 @@
+id=ashrexcue_companion
+name=AshReXcue Companion
+version=v0.2.0-rf02
+versionCode=200
+author=Mikeyphw; AshReXcue contributors
+description=Read-only disabled-item recovery notifications, report history and diagnostics for AshReXcue

@@ -1,0 +1,42 @@
+name: AshReXcue Companion / Offline CI
+on:
+  push:
+    paths:
+      - 'companion/**'
+      - 'tests/test_companion_rf02.py'
+      - '.github/workflows/companion-ci.yml'
+      - 'scripts/apply_refurbish.py'
+      - 'service.sh'
+  pull_request:
+    paths:
+      - 'companion/**'
+      - 'tests/test_companion_rf02.py'
+      - '.github/workflows/companion-ci.yml'
+      - 'scripts/apply_refurbish.py'
+      - 'service.sh'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  offline-checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Shell syntax (no Android SDK or device writes)
+        run: sh -n companion/*.sh companion/bin/*.sh service.sh
+      - name: Offline regression tests
+        run: python3 -m unittest discover -s tests -p 'test_companion_rf02.py' -v
+      - name: Build candidate module
+        run: python3 companion/tools/build_zip.py --out dist/AshReXcue-Companion-v0.2.0.zip
+      - name: Reproducibility
+        run: |
+          python3 companion/tools/build_zip.py --out dist/rebuilt.zip
+          cmp dist/AshReXcue-Companion-v0.2.0.zip dist/rebuilt.zip
+          sha256sum dist/AshReXcue-Companion-v0.2.0.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ashrexcue-companion-rf02-candidate
+          path: dist/AshReXcue-Companion-v0.2.0.zip

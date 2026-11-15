@@ -1,5 +1,7 @@
 # AshReXcue - Bootloop Protector
 
+> **Independent fork:** maintained at [Mikeyphw/AshLooper](https://github.com/Mikeyphw/AshLooper). Original project by [AshBorn / RipperHybrid](https://github.com/RipperHybrid/AshLooper). See [companion module](docs/COMPANION.md) and [fork maintenance notes](docs/FORK_MAINTENANCE.md).
+
 <div align="center">
   <img src="https://raw.githubusercontent.com/RipperHybrid/AshLooper/Master/.github/resources/banner.png" width="50%" alt="AshLooper Banner">
   <br>
