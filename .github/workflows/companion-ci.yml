@@ -1,0 +1,31 @@
+name: AshReXcue Companion RF04 / Offline Qualification
+on:
+  push:
+    paths: ['companion/**', '.github/workflows/companion-ci.yml']
+  pull_request:
+    paths: ['companion/**', '.github/workflows/companion-ci.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  offline:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Shell syntax
+        run: sh -n companion/service.sh companion/action.sh companion/customize.sh companion/uninstall.sh companion/bin/companion.sh companion/bin/synthetic-test.sh
+      - name: Offline tests
+        run: python3 -m unittest discover -s companion/tests -v
+      - name: Candidate ZIP and reproducibility
+        run: |
+          python3 companion/tools/build_zip.py --out dist/Companion-RF04.zip
+          python3 companion/tools/build_zip.py --out dist/Companion-RF04-again.zip
+          cmp dist/Companion-RF04.zip dist/Companion-RF04-again.zip
+          unzip -t dist/Companion-RF04.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ashrexcue-companion-rf04-candidate
+          path: dist/Companion-RF04.zip
