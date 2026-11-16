@@ -14,6 +14,7 @@ FILES = (
     'uninstall.sh',
     'bin/companion.sh',
     'bin/parse-recovery.awk',
+    'bin/synthetic-test.sh',
 )
 BLOCKED = {'utils.sh', 'post-fs-data.sh', 'recovery-notify.sh', 'settings.prop'}
 
@@ -37,8 +38,8 @@ def build(target: Path):
     with zipfile.ZipFile(target) as check:
         if set(check.namelist()) != set(FILES) or check.testzip() is not None:
             raise ValueError('Build inventory/corruption mismatch')
-    print(f'RF03_CANDIDATE_SHA256 {hashlib.sha256(target.read_bytes()).hexdigest()}')
-    print(f'RF03_CANDIDATE_PATH {target}')
+    print(f'RF04_CANDIDATE_SHA256 {hashlib.sha256(target.read_bytes()).hexdigest()}')
+    print(f'RF04_CANDIDATE_PATH {target}')
 
 
 if __name__ == '__main__':

@@ -1,6 +1,6 @@
 id=ashrexcue_companion
 name=AshReXcue Companion
-version=v0.3.0-rf03
-versionCode=300
+version=v0.4.0-rf04
+versionCode=400
 author=Mikeyphw; AshReXcue contributors
 description=Standalone read-only recovery notifications from original AshReXcue logs; does not replace AshLooper

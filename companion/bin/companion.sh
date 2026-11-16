@@ -191,6 +191,14 @@ shell_quote() {
 }
 
 post_notification() {
+    # Synthetic acceptance uses the real reporting path but must NEVER look
+    # like a genuine recovery event in Android's notification shade.
+    if [ "${ARC_SYNTHETIC_TEST:-}" = yes ]; then
+        synthetic_title="[SYNTHETIC TEST] $1"
+        synthetic_body="TEST ONLY. No installed modules or scripts were disabled.
+$2"
+        set -- "$synthetic_title" "$synthetic_body"
+    fi
     if [ -n "${ARC_TEST_NOTIFY:-}" ]; then
         "$ARC_TEST_NOTIFY" "$1" "$2"
         return $?
@@ -320,6 +328,13 @@ case "${1:-run}" in
         ;;
     notify-pending) notify_pending ;;
     test-notification) post_notification 'AshReXcue Companion test' 'Test only. No recovery state changed.' ;;
+    synthetic-test)
+        # Require the actual installed AshLooper to have finished a stable boot
+        # BEFORE creating any fake filesystem. Inside the fixture, every
+        # production path is replaced and no real module is disabled.
+        stable_boot || { say 'Synthetic test refused: original boot not verified stable.'; exit 2; }
+        sh "${0%/*}/synthetic-test.sh" "$0"
+        ;;
     status) status ;;
-    *) say 'Usage: companion.sh {seed|scan|run|status|notify-pending|test-notification}'; exit 2 ;;
+    *) say 'Usage: companion.sh {seed|scan|run|status|notify-pending|test-notification|synthetic-test}'; exit 2 ;;
 esac

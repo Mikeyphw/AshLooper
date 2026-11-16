@@ -245,6 +245,60 @@ class StockAshLooperTests(unittest.TestCase):
         self.run_cmd(env=e)
         self.assertIn('disabled-original', self.calls.read_text())
 
+    def test_rf04_synthetic_end_to_end_isolated_and_labeled(self):
+        # Real code path, fake original module, fake disable markers, fake log.
+        # The actual original fixture and its histories must not change.
+        sandbox = self.root / 'synthetic-sandboxes'
+        sandbox.mkdir()
+        self.seed()
+        self.module('untouched', 'Unchanged module')
+        before = {str(p): p.read_bytes() for p in self.mods.rglob('*') if p.is_file()}
+        before[str(self.log)] = self.log.read_bytes()
+        old_cursors = sorted(self.state.rglob('*'))
+        e = dict(self.env, ARC_SYNTHETIC_TMPDIR=str(sandbox),
+                 ARC_SYNTHETIC_NOTIFIER=str(self.notifier))
+        p = self.run_cmd('synthetic-test', env=e)
+        self.assertIn('RF04_SYNTHETIC_PASS', p.stdout)
+        self.assertIn('originals_untouched=yes', p.stdout)
+        text = self.calls.read_text()
+        self.assertIn('[SYNTHETIC TEST] AshReXcue: 2 item(s) disabled', text)
+        self.assertIn('No installed modules or scripts were disabled.', text)
+        self.assertIn('RF04 Synthetic Module (not installed)', text)
+        self.assertIn('Script: rf04_example.sh', text)
+        self.assertEqual(1, text.count('[SYNTHETIC TEST]'))
+        self.assertFalse(list(sandbox.iterdir()), 'Temporary synthetic files not removed')
+        self.assertEqual(before, {str(p): p.read_bytes() for p in self.mods.rglob('*') if p.is_file()}
+                         | {str(self.log): self.log.read_bytes()})
+        self.assertEqual(old_cursors, sorted(self.state.rglob('*')))
+
+    def test_rf04_synthetic_rejected_when_original_not_stable(self):
+        sandbox = self.root / 'synthetic-sandboxes'
+        sandbox.mkdir()
+        self.settings.write_text('boot=booting\nboot_id=fake-boot-id\n')
+        e = dict(self.env, ARC_TEST_STABLE='no',
+                 ARC_SYNTHETIC_TMPDIR=str(sandbox),
+                 ARC_SYNTHETIC_NOTIFIER=str(self.notifier))
+        p = self.run_cmd('synthetic-test', success=False, env=e)
+        self.assertEqual(2, p.returncode)
+        self.assertIn('Synthetic test refused', p.stdout)
+        self.assertFalse(self.calls.exists())
+        self.assertFalse(list(sandbox.iterdir()))
+
+    def test_rf04_synthetic_notification_failure_cleans_up(self):
+        sandbox = self.root / 'synthetic-sandboxes'
+        sandbox.mkdir()
+        failed = self.root / 'synthetic-notifier-fail.sh'
+        failed.write_text('#!/bin/sh\nexit 19\n')
+        failed.chmod(0o755)
+        e = dict(self.env, ARC_SYNTHETIC_TMPDIR=str(sandbox),
+                 ARC_SYNTHETIC_NOTIFIER=str(failed))
+        p = self.run_cmd('synthetic-test', success=False, env=e)
+        self.assertNotEqual(0, p.returncode)
+        self.assertIn('RF04_SYNTHETIC_FAIL', p.stderr)
+        self.assertNotIn('RF04_SYNTHETIC_PASS', p.stdout)
+        self.assertFalse(list(sandbox.iterdir()))
+        self.assertFalse(self.calls.exists())
+
     def test_shell_injection_stays_in_data(self):
         self.seed()
         marker = self.root / 'INJECTED'
@@ -314,6 +368,7 @@ class PackagingTests(unittest.TestCase):
                 self.assertNotIn('post-fs-data.sh', z.namelist())
                 self.assertNotIn('settings.prop', z.namelist())
                 self.assertIn('bin/parse-recovery.awk', z.namelist())
+                self.assertIn('bin/synthetic-test.sh', z.namelist())
 
     def test_installer_seeds_log_baseline_without_core_mutations(self):
         installer = (ROOT / 'customize.sh').read_text()

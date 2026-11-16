@@ -1,4 +1,4 @@
-# AshReXcue Companion RF03 — independent original-module integration
+# AshReXcue Companion RF04 — independent original-module integration
 
 **Optional standalone root module.** It is installed next to, and **does not replace**, the original [AshReXcue / AshLooper](https://github.com/RipperHybrid/AshLooper). Its module ID is `ashrexcue_companion`, not `AshLooper`.
 
@@ -16,7 +16,7 @@
 
 1. **Keep the original AshReXcue module installed and enabled.** Do **not** install `AshReXcue-Fork-candidate.zip`. That is a core replacement build.
 2. Back up the module and configuration before experimenting with boot protection.
-3. Install **only** `AshReXcue-Companion-v0.3.0-RF03.zip` from your root manager and reboot normally.
+3. Install **only** `AshReXcue-Companion-v0.4.0-RF04.zip` from your root manager and reboot normally.
 4. Run the status and test notification commands:
 
 ```sh
@@ -42,7 +42,7 @@ su -c 'sh /data/adb/modules/ashrexcue_companion/bin/companion.sh notify-pending'
 - If the first boot after installation contains a recovery event but the installer could not initialize the log baseline, that event may be skipped rather than risk showing an old incident.
 - Long names are truncated to 90 characters in notifications, while logged event identifiers are preserved in history.
 - An accepted `cmd notification post` call can still be suppressed by Android's notification settings.
-- This is an **offline-tested candidate**, not physical Android 16 acceptance. Do **not** trigger a real bootloop to test it.
+- Real recovery-event attribution has not been demonstrated during a natural bootloop; RF04 synthetic acceptance tests only a simulated incident. Do **not** trigger a real bootloop to test it.
 - This module does **not** alter existing root-manager module enable/disable states. It only reads them.
 
 ## Source layout
@@ -57,7 +57,23 @@ su -c 'sh /data/adb/modules/ashrexcue_companion/bin/companion.sh notify-pending'
 
 ```sh
 python3 -m unittest discover -s tests -v
-python3 tools/build_zip.py --out dist/AshReXcue-Companion-v0.3.0-RF03.zip
+python3 tools/build_zip.py --out dist/AshReXcue-Companion-v0.4.0-RF04.zip
 ```
 
 Built from original AshReXcue v10.1 log conventions, with attribution to original AshBorn / RipperHybrid. The companion source is independently maintained.
+
+## Safe synthetic acceptance (RF04)
+
+After installing the RF04 candidate and confirming a normal stable boot:
+
+```sh
+su -c 'sh /data/adb/modules/ashrexcue_companion/bin/companion.sh synthetic-test'
+```
+
+This test creates **only temporary fake** module disable markers, backup scripts,
+and AshReXcue-style logs in an isolated sandbox. It exercises event parsing,
+read-only verification, history, notification transport and duplicate suppression.
+The notification is visibly labeled `[SYNTHETIC TEST]`. No original module is
+changed. The sandbox is automatically deleted and does not pollute real
+recovery history. A passing result is **synthetic acceptance**, not evidence
+of recovery handling in a genuine bootloop.
